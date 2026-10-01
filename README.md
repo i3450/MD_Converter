@@ -1,4 +1,4 @@
-# converter.py
+# md_converter.py
 
 Convierte documentos (PDF, Word, Excel, PowerPoint, HTML, CSV e imágenes) a Markdown para pasárselos a una IA gastando menos tokens y obteniendo mejores resultados.
 
@@ -29,7 +29,7 @@ Está basado en [MarkItDown](https://github.com/microsoft/markitdown) de Microso
 
 1. Descargá el proyecto (botón **Code → Download ZIP**) o clonalo:
    ```
-   git clone https://github.com/<tu-usuario>/<tu-repo>.git
+   git clone https://github.com/i3450/MD_Converter.git
    ```
 2. Abrí una terminal dentro de la carpeta del proyecto.
 3. Recomendado, creá un entorno virtual:
@@ -48,7 +48,7 @@ Sin configurar nada, el script convierte todo pero **no describe imágenes** (la
 
 Para describir imágenes con Azure OpenAI:
 
-1. Copiá `.env.example` con el nombre `.env`, en la misma carpeta que `converter.py`:
+1. Copiá `.env.example` con el nombre `.env`, en la misma carpeta que `md_converter.py`:
    - Windows: `copy .env.example .env`
    - Mac / Linux: `cp .env.example .env`
 2. Abrí `.env` y completá los tres valores:
@@ -67,10 +67,10 @@ Para describir imágenes con Azure OpenAI:
 ## Uso
 
 ```
-python converter.py                      # convierte los archivos de la carpeta actual
-python converter.py -i "C:\ruta\docs"    # otra carpeta de entrada
-python converter.py -i docs -r           # incluye subcarpetas
-python converter.py --force              # reconvierte todo
+python md_converter.py                      # convierte los archivos de la carpeta actual
+python md_converter.py -i "C:\ruta\docs"    # otra carpeta de entrada
+python md_converter.py -i docs -r           # incluye subcarpetas
+python md_converter.py --force              # reconvierte todo
 ```
 
 Los resultados quedan en la carpeta `Converted_MD_Files`, conservando la extensión original: `informe.pdf` produce `informe.pdf.md`.
@@ -134,7 +134,7 @@ Las páginas con ecuaciones se marcan como `<!-- Página 1/3 | contiene fórmula
 
 | Mensaje o síntoma | Qué revisar |
 |---|---|
-| `Falta la variable de entorno ...` | El `.env` está incompleto o no está junto a `converter.py`. |
+| `Falta la variable de entorno ...` | El `.env` está incompleto o no está junto a `md_converter.py`. |
 | `ModuleNotFoundError` | Corré `pip install -r requirements.txt` con el entorno virtual activado. |
 | Error 404 al describir imágenes | Revisá el endpoint y que `AZURE_OPENAI_DEPLOYMENT` sea el nombre del deployment. |
 | `No se pudo describir una imagen ...` | El mensaje trae el error de la API. Revisá que el modelo acepte imágenes y que tengas cuota. |

@@ -1,46 +1,17 @@
 """
-Convierte archivos (pdf, docx, xlsx, pptx, html, csv, imágenes) a Markdown para pasárselos
-a una IA gastando menos tokens. Usa MarkItDown y, si se configura Azure OpenAI, describe
-las imágenes.
+md_converter.py: convierte PDF, Word, Excel, PowerPoint, HTML, CSV e imagenes
+a Markdown para pasarselos a una IA gastando menos tokens.
 
 Uso:
-    python converter.py                # carpeta actual
-    python converter.py -i docs -r     # carpeta "docs", con subcarpetas
-    python converter.py --force        # reconvierte todo
+    python md_converter.py                # convierte los archivos de la carpeta actual
+    python md_converter.py -i docs -r     # carpeta "docs", con subcarpetas
+    python md_converter.py --force        # reconvierte todo
+    python md_converter.py --help         # ver todas las opciones
 
-Si hay PDFs o PPTX para convertir, el script pregunta Y/N (Enter = No):
-  - PDF:  ¿describir sus imágenes con IA? (usa la API y suma tokens)
-  - PPTX: ¿descartar las notas del orador? (ahorra tokens)
-Para no tener que contestar:
-    --describe-pdf-images / --no-describe-pdf-images
-    --skip-notes / --keep-notes
-
-Las imágenes se describen en 1 a 3 oraciones (tipo de imagen, qué representa, ejes,
-títulos), SIN transcribir cifras: si la IA que lea el .md necesita los datos, hay que
-pasarle la imagen original. Los archivos con imágenes descriptas llevan al inicio una
-nota que se lo indica a la IA, así no hace falta repetirlo en cada prompt.
-
-En PDFs, las tablas se extraen con pdfplumber (celdas separadas, en Markdown), cada
-página lleva un marcador <!-- Página N/Total --> y se quitan los encabezados y pies de
-página repetidos (el encabezado se conserva una vez, en la primera página).
-
-En Excel, cada hoja se divide en bloques (tablas separadas por filas o columnas vacías),
-sin celdas "NaN" ni encabezados falsos, y las celdas combinadas en vertical repiten su valor.
-
-Requiere:
-    pip install "markitdown[all]" openai pdfplumber pypdf pillow python-dotenv
-(pdfplumber: tablas y páginas de PDF; pypdf + pillow: imágenes de PDF;
- python-dotenv es opcional)
-
-Descripción de imágenes con IA (opcional). Sin estas variables el script convierte igual,
-pero sin describir imágenes. Se definen como variables de entorno o en un archivo .env
-(ver .env.example):
-    AZURE_OPENAI_API_KEY
-    AZURE_OPENAI_ENDPOINT
-    AZURE_OPENAI_DEPLOYMENT
-Opcional:
-    AZURE_OPENAI_API_VERSION  (default: 2024-08-01-preview)
+Las imagenes se describen con Azure OpenAI si hay credenciales en un archivo .env
+(opcional). Instalacion, configuracion y todas las opciones: ver https://github.com/i3450/MD_Converter.
 """
+
 import argparse
 import base64
 import hashlib
