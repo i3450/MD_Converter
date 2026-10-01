@@ -1,0 +1,20 @@
+# Secretos: nunca se suben
+.env
+
+# Resultado de las conversiones y archivos del entorno
+Converted_MD_Files/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Documentos que se convierten (para no subirlos por error)
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+*.csv
+*.html
+*.png
+*.jpg
+*.jpeg
