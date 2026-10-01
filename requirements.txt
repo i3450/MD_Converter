@@ -1,0 +1,7 @@
+markitdown[all]
+openai
+pdfplumber
+pypdf
+pillow
+openpyxl
+python-dotenv
