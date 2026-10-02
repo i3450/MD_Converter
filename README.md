@@ -131,7 +131,7 @@ Las páginas con ecuaciones se marcan como `<!-- Página 1/3 | contiene fórmula
 - Todo se procesa en tu computadora, excepto las imágenes: se envían al proveedor elegido las imágenes sueltas, las de los PPTX y las de los PDF (solo si contestás que sí).
 - En los PDF se describen hasta 3 imágenes por página y 30 por archivo, y se ignoran las muy chicas y las repetidas.
 - Cada descripción suele ocupar unos 100 tokens.
-- Las descripciones de imágenes de PDF se guardan en `.image_cache.json`, dentro de la carpeta de salida: al reconvertir con `--force` no se vuelven a pagar. Si cambia el modelo, se vuelven a pedir.
+- Las descripciones de imágenes de PDF se guardan en `.image_cache.json`, junto a `md_converter.py` (no se sube a GitHub): al reconvertir con `--force`, o con otra carpeta de salida, no se vuelven a pagar. Si cambia el modelo, se vuelven a pedir. Borrá el archivo para empezar de cero.
 - Si la API falla 3 veces seguidas en un PDF, el script deja de describir sus imágenes y avisa. Ese `.md` queda sin descripciones: reconvertilo con `--force` cuando lo arregles.
 
 ## Limitaciones
