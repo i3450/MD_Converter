@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.image_cache.json
 
 # Documentos que se convierten (para no subirlos por error)
 *.pdf
