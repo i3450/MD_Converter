@@ -5,3 +5,4 @@ pypdf
 pillow
 openpyxl
 python-dotenv
+tiktoken

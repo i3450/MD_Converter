@@ -6,9 +6,10 @@ Uso:
     python md_converter.py                # convierte los archivos de la carpeta actual
     python md_converter.py -i docs -r     # carpeta "docs", con subcarpetas
     python md_converter.py --force        # reconvierte todo
+    python md_converter.py --benchmark    # compara los tokens contra MarkItDown puro
     python md_converter.py --help         # ver todas las opciones
 
-Las imagenes se describen con Azure OpenAI si hay credenciales en un archivo .env
+Las imagenes se describen con OpenAI o Azure OpenAI si hay credenciales en un archivo .env
 (opcional). Instalacion, configuracion y todas las opciones: ver https://github.com/i3450/MD_Converter.
 """
 
@@ -16,6 +17,7 @@ import argparse
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -25,7 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from markitdown import MarkItDown
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 
 try:
     import pdfplumber
@@ -58,6 +60,8 @@ WARN_TOKENS = 30_000  # avisa si un .md estimado supera esto
 MIN_IMAGE_SIDE = 150      # ignora imágenes más chicas (logos, íconos)
 MAX_IMAGES_PER_PAGE = 3
 MAX_IMAGES_PER_PDF = 30   # tope de gasto por archivo
+MAX_CONSECUTIVE_FAILS = 3  # fallos seguidos de la API tras los cuales se abandona el PDF
+CACHE_FILE = ".image_cache.json"  # descripciones ya pagadas, en la carpeta de salida
 MAX_DESC_TOKENS = 400         # descripción breve; si se corta, queda marcado
 REASONING_MARGIN = 4000   # extra para modelos que "piensan" (usan max_completion_tokens)
 
@@ -84,21 +88,31 @@ def get_env(name: str, default: str | None = None) -> str:
 
 
 LLM_VARS = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT")
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"  # con visión y barato; se cambia con OPENAI_MODEL en el .env
 
 
 def build_converter():
-    """Devuelve (MarkItDown, cliente, modelo). Sin ninguna credencial de Azure el script
-    funciona igual, pero sin describir imágenes. Si las credenciales están a medias, avisa cuál falta."""
-    if not any(os.environ.get(v) for v in LLM_VARS):
-        print("Aviso: no hay credenciales de Azure OpenAI (archivo .env). "
+    """Devuelve (MarkItDown, cliente, modelo). Proveedor de imágenes, en este orden:
+    1) Azure OpenAI, si hay variables AZURE_OPENAI_*; 2) OpenAI, si hay OPENAI_API_KEY.
+    Sin ninguna credencial el script funciona igual, pero sin describir imágenes.
+    Si las de Azure están a medias, avisa cuál falta."""
+    if any(os.environ.get(v) for v in LLM_VARS):
+        client = AzureOpenAI(
+            azure_endpoint=get_env("AZURE_OPENAI_ENDPOINT"),
+            api_key=get_env("AZURE_OPENAI_API_KEY"),
+            api_version=get_env("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+        )
+        model = get_env("AZURE_OPENAI_DEPLOYMENT")
+        provider = "Azure OpenAI"
+    elif os.environ.get("OPENAI_API_KEY"):
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])  # también lee OPENAI_BASE_URL si existe
+        model = os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+        provider = "OpenAI"
+    else:
+        print("Aviso: no hay credenciales de OpenAI ni de Azure OpenAI (archivo .env). "
               "Se convierte todo, pero sin describir imágenes.\n")
         return MarkItDown(), None, None
-    client = AzureOpenAI(
-        azure_endpoint=get_env("AZURE_OPENAI_ENDPOINT"),
-        api_key=get_env("AZURE_OPENAI_API_KEY"),
-        api_version=get_env("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
-    )
-    model = get_env("AZURE_OPENAI_DEPLOYMENT")
+    print(f"Descripción de imágenes: {provider}, modelo {model}\n")
     md = MarkItDown(llm_client=client, llm_model=model, llm_prompt=IMAGE_PROMPT)
     return md, client, model
 
@@ -205,11 +219,45 @@ def _chat_create(client, model, messages):
         raise
 
 
-def describe_page_images(client, model, page, seen, budget):
-    """Describe las imágenes raster de una página. `budget` es una lista [restantes]."""
+class ImageCache:
+    """Caché en disco: (modelo + prompt + hash de la imagen) -> descripción.
+    Evita volver a pagar la API por la misma imagen, por ejemplo al usar --force."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+
+    @staticmethod
+    def key(model: str, digest: str) -> str:
+        prompt_id = hashlib.md5(IMAGE_PROMPT.encode("utf-8")).hexdigest()[:8]
+        return f"{model}|{prompt_id}|{digest}"  # si cambia el modelo o el prompt, no se reutiliza
+
+    def get(self, key: str):
+        return self.data.get(key)
+
+    def set(self, key: str, desc: str) -> None:
+        self.data[key] = desc
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as e:
+            print(f"  Aviso: no se pudo guardar el caché de imágenes ({e.__class__.__name__}).")
+
+
+def new_image_budget() -> dict:
+    return {"left": MAX_IMAGES_PER_PDF, "fails": 0, "stopped": False}
+
+
+def describe_page_images(client, model, cache, page, seen, budget):
+    """Describe las imágenes raster de una página. `budget` lleva el estado del PDF:
+    imágenes restantes, fallos seguidos de la API y si ya se abandonó."""
     out = []
     for img in page.images:
-        if len(out) >= MAX_IMAGES_PER_PAGE or budget[0] <= 0:
+        if len(out) >= MAX_IMAGES_PER_PAGE or budget["left"] <= 0 or budget["stopped"]:
             break
         try:
             pil = img.image.convert("RGB")
@@ -219,16 +267,35 @@ def describe_page_images(client, model, page, seen, budget):
             if digest in seen:  # misma imagen repetida (logos, fondos)
                 continue
             seen.add(digest)
-            pil.thumbnail((1024, 1024))
-            buf = io.BytesIO()
-            pil.save(buf, format="JPEG", quality=85)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            r = _chat_create(client, model, [{"role": "user", "content": [
-                {"type": "text", "text": IMAGE_PROMPT},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ]}])
-            budget[0] -= 1
+        except Exception as e:  # imagen ilegible: no es un problema de la API
+            print(f"  No se pudo leer una imagen ({e.__class__.__name__}): {e}")
+            continue
+
+        key = ImageCache.key(model, digest)
+        desc = cache.get(key) if cache else None
+        if desc is None:
+            try:
+                pil.thumbnail((1024, 1024))
+                buf = io.BytesIO()
+                pil.save(buf, format="JPEG", quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                r = _chat_create(client, model, [{"role": "user", "content": [
+                    {"type": "text", "text": IMAGE_PROMPT},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]}])
+            except Exception as e:
+                budget["fails"] += 1
+                print(f"  No se pudo describir una imagen ({e.__class__.__name__}): {e}")
+                if budget["fails"] >= MAX_CONSECUTIVE_FAILS:
+                    budget["stopped"] = True
+                    print(f"  La API falló {MAX_CONSECUTIVE_FAILS} veces seguidas: no se describen más "
+                          "imágenes de este PDF. Revisá la clave, el endpoint y el nombre del modelo o deployment.\n"
+                          "  Este .md queda sin esas descripciones y la próxima corrida lo salteará: "
+                          "reconvertilo con --force cuando lo arregles (el caché evita pagar las ya hechas).")
+                continue
+            budget["fails"] = 0
+            budget["left"] -= 1
             choice = r.choices[0]
             desc = (choice.message.content or "").strip()
             if not desc:
@@ -238,9 +305,11 @@ def describe_page_images(client, model, page, seen, budget):
             if choice.finish_reason == "length":
                 desc += "\n(DESCRIPCIÓN TRUNCADA por el límite de tokens)"
                 print("  Aviso: una descripción se cortó por el límite de tokens.")
-            out.append(f"[Imagen {len(out) + 1}: {desc}]")
-        except Exception as e:
-            print(f"  No se pudo describir una imagen ({e.__class__.__name__}): {e}")
+            elif cache:
+                cache.set(key, desc)  # las truncadas no se guardan: conviene reintentarlas
+        else:
+            budget["left"] -= 1  # el caché cuenta para el tope, así el resultado no cambia entre corridas
+        out.append(f"[Imagen {len(out) + 1}: {desc}]")
     return out
 
 
@@ -303,9 +372,9 @@ def strip_repeated_lines(pages: list) -> list:
 def convert_pdf_by_pages(path: Path, describe=None) -> str:
     """PDF -> Markdown con marcador por página, tablas separadas por celda, sin encabezados
     ni pies repetidos y, opcionalmente, descripción de imágenes.
-    `describe` = (client, model) o None."""
+    `describe` = (client, model, caché) o None."""
     reader = PdfReader(str(path)) if (describe and PdfReader) else None
-    seen, budget = set(), [MAX_IMAGES_PER_PDF]
+    seen, budget = set(), new_image_budget()
     texts = []
     with pdfplumber.open(str(path)) as pdf:
         for i, page in enumerate(pdf.pages, 1):
@@ -339,14 +408,16 @@ XLSX_MAX_ROWS = 200  # filas máximas por bloque; el resto se omite con un aviso
 
 
 def _fmt_number(v) -> str:
-    """Número sin redondeos que cambien el valor (0.00000785 no pasa a 0.000008)."""
+    """Número sin redondeos que cambien el valor (0.00000785 no pasa a 0.000008).
+    Usa 15 cifras significativas, las que guarda Excel: no se pierde información real
+    y se evita el ruido de coma flotante (0.1 + 0.2 sale 0.3, no 0.30000000000000004)."""
     if isinstance(v, int):
         return str(v)
     if v != v or v in (float("inf"), float("-inf")):
         return str(v)
     if v == int(v) and abs(v) < 1e15:
         return str(int(v))
-    return format(Decimal(f"{v:.10g}"), "f")
+    return format(Decimal(f"{v:.15g}"), "f")
 
 
 def _xlsx_text(v) -> str:
@@ -493,6 +564,71 @@ def convert_with_retries(md, path: Path, describe=None, skip_notes=False) -> str
             time.sleep(wait)
 
 
+# -------------------------------------------------------------- tokens y benchmark
+_encoding = False  # False = todavía no se probó; None = tiktoken no disponible
+
+
+def _get_encoding(warn_missing: bool = False):
+    """tiktoken (opcional: pip install tiktoken). La primera vez baja el vocabulario,
+    así que necesita internet; si falla, se usa la estimación caracteres / 4 y se avisa por qué."""
+    global _encoding
+    if _encoding is False:
+        try:
+            import tiktoken
+            _encoding = tiktoken.get_encoding("o200k_base")
+        except ImportError:
+            _encoding = None
+            if warn_missing:
+                print("Aviso: tiktoken no está instalado en este Python (probá: py -m pip install tiktoken). "
+                      "Los tokens se estiman con caracteres / 4.\n")
+        except Exception as e:  # instalado, pero no pudo bajar o cargar el vocabulario
+            _encoding = None
+            print(f"Aviso: tiktoken no pudo cargar su vocabulario ({e.__class__.__name__}: {e}). "
+                  "Los tokens se estiman con caracteres / 4.\n")
+    return _encoding
+
+
+def count_tokens(text: str) -> int:
+    enc = _get_encoding()
+    if enc is not None:
+        return len(enc.encode(text, disallowed_special=()))
+    return len(text) // 4
+
+
+def token_method() -> str:
+    return "tiktoken (o200k_base)" if _get_encoding() is not None else "estimación (caracteres / 4)"
+
+
+def benchmark_file(plain: MarkItDown, path: Path, text: str):
+    """Compara contra la conversión estándar de MarkItDown, sin LLM ni ajustes.
+    Devuelve (tokens_markitdown, tokens_este_script, tokens_de_descripciones) o None."""
+    try:
+        raw = count_tokens(plain.convert(str(path)).text_content)
+    except Exception as e:
+        print(f"  Benchmark: MarkItDown no pudo convertir el archivo ({e.__class__.__name__}).")
+        return None
+    if raw <= 0:
+        return None
+    imgs = sum(count_tokens(x) for x in IMG_RE.findall(text))
+    return raw, count_tokens(text), imgs
+
+
+def write_benchmark(rows, output_dir: Path) -> Path:
+    """rows = [(nombre, tokens_markitdown, tokens_este_script)]. Escribe una tabla lista para el README."""
+    lines = ["| Archivo | MarkItDown puro | MD_Converter | Cambio |", "|---|---:|---:|---:|"]
+    for name, raw, ours in rows:
+        lines.append(f"| {name} | {raw:,} | {ours:,} | {(ours - raw) / raw:+.0%} |")
+    if len(rows) > 1:
+        raw_t, ours_t = sum(r[1] for r in rows), sum(r[2] for r in rows)
+        lines.append(f"| **Total** | **{raw_t:,}** | **{ours_t:,}** | **{(ours_t - raw_t) / raw_t:+.0%}** |")
+    lines += ["", f"Tokens contados con {token_method()}. \"MarkItDown puro\" es la conversión estándar, "
+                  "sin descripción de imágenes. \"MD_Converter\" incluye, si las hay, las descripciones "
+                  "de imágenes y las notas para la IA."]
+    out = output_dir / "benchmark.md"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
 # ------------------------------------------------------------------ estadísticas
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 NOTE_PREFIX = "> Nota del conversor:"
@@ -537,22 +673,26 @@ def section_stats(text: str):
     rows, current, buf = [], "(inicio)", []
     for line in text.splitlines():
         if line.startswith("#"):
-            rows.append((current, len("\n".join(buf)) // 4))
+            rows.append((current, count_tokens("\n".join(buf))))
             current, buf = line.lstrip("#").strip(), []
         else:
             buf.append(line)
-    rows.append((current, len("\n".join(buf)) // 4))
+    rows.append((current, count_tokens("\n".join(buf))))
     return [(t, n) for t, n in rows if n > 0]
 
 
-def print_stats(text: str, top: int = 5):
+def print_stats(text: str, top: int = 5, show_breakdown: bool = False):
+    """Siempre informa las descripciones de imágenes (cuestan API). El detalle de páginas o
+    secciones más pesadas solo se muestra si `show_breakdown` (--stats o archivo muy grande)."""
     imgs = IMG_RE.findall(text)
     if imgs:
-        print(f"  Descripciones de imágenes: {len(imgs)} (~{sum(len(x) for x in imgs) // 4:,} tokens)")
+        print(f"  Descripciones de imágenes: {len(imgs)} (~{sum(count_tokens(x) for x in imgs):,} tokens)")
+    if not show_breakdown:
+        return
 
     if PAGE_RE.search(text):  # PDF: pesa más por página que por encabezado
         chunks = PAGE_RE.split(text)  # [previo, n, total, texto, n, total, texto, ...]
-        pages = [(int(chunks[i]), len(chunks[i + 2]) // 4) for i in range(1, len(chunks), 3)]
+        pages = [(int(chunks[i]), count_tokens(chunks[i + 2])) for i in range(1, len(chunks), 3)]
         if len(pages) > 1:
             print("  Páginas más pesadas:")
             for n, tokens in sorted(pages, key=lambda x: x[1], reverse=True)[:top]:
@@ -609,6 +749,12 @@ def main():
                         help="describir imágenes de PDFs sin preguntar (usa la API)")
     parser.add_argument("--no-describe-pdf-images", action="store_true",
                         help="no describir imágenes de PDFs y no preguntar")
+    parser.add_argument("--stats", action="store_true",
+                        help="mostrar siempre las páginas/secciones más pesadas "
+                             "(por defecto solo si el archivo supera WARN_TOKENS)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="comparar los tokens de cada archivo contra MarkItDown puro y guardar benchmark.md "
+                             "(incluye los ya convertidos, sin volver a convertirlos)")
     parser.add_argument("--skip-notes", action="store_true",
                         help="descartar las notas del orador de los PPTX sin preguntar")
     parser.add_argument("--keep-notes", action="store_true",
@@ -621,6 +767,7 @@ def main():
 
     md, client, model = build_converter()
     llm_enabled = client is not None
+    _get_encoding(warn_missing=args.benchmark)  # si falla tiktoken, avisa al principio
     files = list(find_files(input_dir, args.recursive, output_dir))
     if not files:
         print(f"No se encontraron archivos soportados ({', '.join(sorted(EXTENSIONS))}).")
@@ -642,7 +789,7 @@ def main():
     # --- PDFs: ¿describir imágenes?
     can_describe = llm_enabled and pdfplumber is not None and PdfReader is not None
     if args.describe_pdf_images and not can_describe:
-        print("Aviso: --describe-pdf-images se ignora (falta Azure OpenAI, pdfplumber o pypdf).\n")
+        print("Aviso: --describe-pdf-images se ignora (falta configurar OpenAI/Azure OpenAI, o instalar pdfplumber o pypdf).\n")
     if args.no_describe_pdf_images or not pending_pdfs or not can_describe:
         describe_images = False
     elif args.describe_pdf_images:
@@ -653,7 +800,7 @@ def main():
             "¿Agregar una descripción de sus imágenes con IA? (usa la API y suma tokens)"
         )
         print()
-    describe = (client, model) if describe_images else None
+    describe = (client, model, ImageCache(output_dir / CACHE_FILE)) if describe_images else None
 
     # --- PPTX: ¿descartar notas del orador?
     if args.keep_notes or not pending_pptx:
@@ -668,6 +815,21 @@ def main():
         print()
 
     ok = skipped = failed = 0
+    plain = MarkItDown() if args.benchmark else None
+    bench_rows = []
+
+    def run_benchmark(rel, src, text):
+        if plain is None or src.suffix.lower() in IMAGE_EXTS:
+            return
+        result = benchmark_file(plain, src, text)
+        if result is None:
+            return
+        raw, ours, imgs = result
+        bench_rows.append((str(rel), raw, ours))
+        msg = f"  Benchmark: MarkItDown puro ~{raw:,} -> este script ~{ours:,} tokens ({(ours - raw) / raw:+.0%})"
+        if imgs:
+            msg += f"; incluye ~{imgs:,} de descripciones de imágenes"
+        print(msg)
 
     for src in files:
         # Se conserva la extensión original: informe.pdf -> informe.pdf.md
@@ -678,10 +840,12 @@ def main():
         if not needs_conversion(src, dst, args.force):
             print(f"Salteado: {rel} (ya convertido)")
             skipped += 1
+            if plain is not None:
+                run_benchmark(rel, src, dst.read_text(encoding="utf-8"))
             continue
 
         if not llm_enabled and src.suffix.lower() in IMAGE_EXTS:
-            print(f"Salteado: {rel} (describir imágenes requiere configurar Azure OpenAI)")
+            print(f"Salteado: {rel} (describir imágenes requiere configurar OpenAI o Azure OpenAI en el .env)")
             skipped += 1
             continue
 
@@ -689,18 +853,24 @@ def main():
         try:
             text = clean_markdown(add_notes(convert_with_retries(md, src, describe, skip_notes), src, llm_enabled))
             dst.write_text(text, encoding="utf-8")
-            est_tokens = len(text) // 4  # estimación aproximada
+            est_tokens = count_tokens(text)  # tiktoken si está instalado; si no, caracteres / 4
             msg = f"  OK (~{est_tokens:,} tokens)"
             if est_tokens > WARN_TOKENS:
                 msg += "  <-- muy grande, considerá recortarlo"
             print(msg)
-            print_stats(text)
+            print_stats(text, show_breakdown=args.stats or est_tokens > WARN_TOKENS)
+            run_benchmark(rel, src, text)
             ok += 1
         except Exception as e:
             print(f"  Error: {e}")
             failed += 1
 
     print(f"\nListo. Convertidos: {ok} | Salteados: {skipped} | Con error: {failed}")
+    if bench_rows:
+        out = write_benchmark(bench_rows, output_dir)
+        raw_t, ours_t = sum(r[1] for r in bench_rows), sum(r[2] for r in bench_rows)
+        print(f"Benchmark [{token_method()}]: {raw_t:,} -> {ours_t:,} tokens ({(ours_t - raw_t) / raw_t:+.0%}). "
+              f"Tabla guardada en {out}")
 
 
 if __name__ == "__main__":
